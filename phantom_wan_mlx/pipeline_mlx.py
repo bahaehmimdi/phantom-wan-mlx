@@ -1,11 +1,20 @@
 """Phantom-Wan S2V inference entry (MLX).
 
+Examples:
     from phantom_wan_mlx import pipeline_mlx as P
+
+    # Standard usage without LoRA:
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4")
+
+    # With a single LoRA:
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", loras="style.safetensors", lora_scale=0.8)
+
+    # With multiple LoRAs (with individual weights):
     P.s2v(
         "two friends walking", 
         ["a.png", "b.png"], 
         "out.mp4", 
-        loras=[("style_lora.safetensors", 0.8), ("character_lora.safetensors", 0.5)]
+        loras=[("style.safetensors", 0.8), ("character.safetensors", 0.5)]
     )
 
 reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
@@ -16,6 +25,7 @@ from pathlib import Path
 from typing import Sequence, Union, Tuple
 
 import mlx.core as mx
+import mlx.utils as utils
 import numpy as np
 from PIL import Image
 
@@ -31,7 +41,7 @@ NEG_PROMPT = (
     "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 
-# Type alias for flexible LoRA inputs
+# Type alias for flexible multi-LoRA inputs
 LoraInput = Union[
     str, 
     Path, 
@@ -49,36 +59,36 @@ def _apply_loras(model, loras: LoraInput, default_scale: float = 1.0, verbose: b
     lora_list: list[tuple[Path, float]] = []
     if isinstance(loras, (str, Path)):
         lora_list.append((Path(loras), default_scale))
-    elif isinstance(loras, tuple):
+    elif isinstance(loras, tuple) and len(loras) == 2:
         lora_list.append((Path(loras[0]), float(loras[1])))
-    elif isinstance(loras, sequence := (list, tuple)):
+    elif isinstance(loras, (list, tuple)):
         for item in loras:
             if isinstance(item, (str, Path)):
                 lora_list.append((Path(item), default_scale))
             elif isinstance(item, (list, tuple)) and len(item) == 2:
                 lora_list.append((Path(item[0]), float(item[1])))
 
-    # Retrieve current model parameters
-    flat_params = mx.tree_flatten(model.parameters())
+    # Retrieve current model parameters using mlx.utils
+    flat_params = utils.tree_flatten(model.parameters())
     param_dict = dict(flat_params)
     accumulated_deltas: dict[str, mx.array] = {}
 
     for lora_path, scale in lora_list:
         if verbose:
-            print(f"Loading LoRA: {lora_path.name} (scale={scale})...", flush=True)
+            print(f"[LoRA] Injecting weights from {lora_path.name} (scale={scale})...", flush=True)
 
         lora_weights = mx.load(str(lora_path))
 
         for name, p in param_dict.items():
             delta = None
 
-            # Case A: Explicit weight deltas saved directly in target key format
+            # Case A: Exact parameter key match (pre-fused delta format)
             if name in lora_weights:
                 delta = scale * lora_weights[name]
 
-            # Case B: Standard LoRA decomposed matrices (lora_up / lora_down)
+            # Case B: Standard decomposed LoRA matrices (lora_up / lora_down)
             else:
-                base_key = name.rsplit(".", 1)[0]  # strip '.weight'
+                base_key = name.rsplit(".", 1)[0]  # Strip '.weight'
                 up_key = f"{base_key}.lora_up.weight"
                 down_key = f"{base_key}.lora_down.weight"
 
@@ -87,17 +97,17 @@ def _apply_loras(model, loras: LoraInput, default_scale: float = 1.0, verbose: b
                     up_w = lora_weights[up_key]
                     delta = (up_w @ down_w) * scale
 
-            # Accumulate deltas if a match was found
+            # Accumulate deltas across multiple LoRAs
             if delta is not None:
                 if name in accumulated_deltas:
                     accumulated_deltas[name] = accumulated_deltas[name] + delta
                 else:
                     accumulated_deltas[name] = delta
 
-    # Apply all accumulated deltas onto the model parameters
+    # Update model tree parameters in-place
     if accumulated_deltas:
         updates = [(name, param_dict[name] + accumulated_deltas[name]) for name in accumulated_deltas]
-        model.update(mx.tree_unflatten(updates))
+        model.update(utils.tree_unflatten(updates))
 
 
 def encode_prompt(prompt: str, phantom_pth=None):
@@ -120,7 +130,7 @@ def _save_video(frames_bchw, path, fps=16):
 def s2v(prompt: str, reference_images: list, output_path: str,
         size=(832, 480), frame_num: int = 81, steps: int = 50, shift: float = 5.0,
         guide_img: float = 5.0, guide_text: float = 7.5, seed: int = 0,
-        phantom_pth=None, vae_pth=None, 
+        phantom_pth=None, vae_pth=None,
         loras: LoraInput | None = None, lora_scale: float = 1.0,
         lossless_decode: bool = True, precomputed_context=None, precomputed_context_null=None, verbose: bool = True):
     """Generate a subject-consistent video from a prompt + reference images."""
