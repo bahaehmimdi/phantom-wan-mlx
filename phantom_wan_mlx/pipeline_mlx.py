@@ -1,13 +1,19 @@
 """Phantom-Wan S2V inference entry (MLX).
 
     from phantom_wan_mlx import pipeline_mlx as P
-    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4")
+    P.s2v(
+        "two friends walking", 
+        ["a.png", "b.png"], 
+        "out.mp4", 
+        loras=[("style_lora.safetensors", 0.8), ("character_lora.safetensors", 0.5)]
+    )
 
 reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence, Union, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -24,6 +30,74 @@ NEG_PROMPT = (
     "低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，"
     "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
+
+# Type alias for flexible LoRA inputs
+LoraInput = Union[
+    str, 
+    Path, 
+    Tuple[Union[str, Path], float], 
+    Sequence[Union[str, Path, Tuple[Union[str, Path], float]]]
+]
+
+
+def _apply_loras(model, loras: LoraInput, default_scale: float = 1.0, verbose: bool = True):
+    """Fuses one or multiple LoRA weights directly into the MLX DiT parameters in-place."""
+    if not loras:
+        return
+
+    # Normalize input into a standard list of (Path, scale) tuples
+    lora_list: list[tuple[Path, float]] = []
+    if isinstance(loras, (str, Path)):
+        lora_list.append((Path(loras), default_scale))
+    elif isinstance(loras, tuple):
+        lora_list.append((Path(loras[0]), float(loras[1])))
+    elif isinstance(loras, sequence := (list, tuple)):
+        for item in loras:
+            if isinstance(item, (str, Path)):
+                lora_list.append((Path(item), default_scale))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                lora_list.append((Path(item[0]), float(item[1])))
+
+    # Retrieve current model parameters
+    flat_params = mx.tree_flatten(model.parameters())
+    param_dict = dict(flat_params)
+    accumulated_deltas: dict[str, mx.array] = {}
+
+    for lora_path, scale in lora_list:
+        if verbose:
+            print(f"Loading LoRA: {lora_path.name} (scale={scale})...", flush=True)
+
+        lora_weights = mx.load(str(lora_path))
+
+        for name, p in param_dict.items():
+            delta = None
+
+            # Case A: Explicit weight deltas saved directly in target key format
+            if name in lora_weights:
+                delta = scale * lora_weights[name]
+
+            # Case B: Standard LoRA decomposed matrices (lora_up / lora_down)
+            else:
+                base_key = name.rsplit(".", 1)[0]  # strip '.weight'
+                up_key = f"{base_key}.lora_up.weight"
+                down_key = f"{base_key}.lora_down.weight"
+
+                if up_key in lora_weights and down_key in lora_weights:
+                    down_w = lora_weights[down_key]
+                    up_w = lora_weights[up_key]
+                    delta = (up_w @ down_w) * scale
+
+            # Accumulate deltas if a match was found
+            if delta is not None:
+                if name in accumulated_deltas:
+                    accumulated_deltas[name] = accumulated_deltas[name] + delta
+                else:
+                    accumulated_deltas[name] = delta
+
+    # Apply all accumulated deltas onto the model parameters
+    if accumulated_deltas:
+        updates = [(name, param_dict[name] + accumulated_deltas[name]) for name in accumulated_deltas]
+        model.update(mx.tree_unflatten(updates))
 
 
 def encode_prompt(prompt: str, phantom_pth=None):
@@ -46,8 +120,9 @@ def _save_video(frames_bchw, path, fps=16):
 def s2v(prompt: str, reference_images: list, output_path: str,
         size=(832, 480), frame_num: int = 81, steps: int = 50, shift: float = 5.0,
         guide_img: float = 5.0, guide_text: float = 7.5, seed: int = 0,
-        phantom_pth=None, vae_pth=None, lossless_decode: bool = True,
-        precomputed_context=None, precomputed_context_null=None, verbose: bool = True):
+        phantom_pth=None, vae_pth=None, 
+        loras: LoraInput | None = None, lora_scale: float = 1.0,
+        lossless_decode: bool = True, precomputed_context=None, precomputed_context_null=None, verbose: bool = True):
     """Generate a subject-consistent video from a prompt + reference images."""
     w_px, h_px = size
     phantom_pth = phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth"
@@ -55,6 +130,10 @@ def s2v(prompt: str, reference_images: list, output_path: str,
 
     cfg_run = PhantomWanConfig.s2v_1_3b()
     model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
+
+    # Multi-LoRA dynamic injection
+    if loras is not None:
+        _apply_loras(model, loras, default_scale=lora_scale, verbose=verbose)
 
     # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
     # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
