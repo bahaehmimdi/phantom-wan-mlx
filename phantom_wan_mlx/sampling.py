@@ -46,7 +46,7 @@ def sample_s2v(
     mx.random.seed(seed)
     latent = mx.random.normal((16, f_latent + k, h_latent, w_latent))   # [16, F+K, h, w]
 
-    # Ensure context tensors carry batch dimension [1, seq, 4096]
+    # Ensure context tensors carry 3D shape [1, seq, 4096]
     if context.ndim == 2:
         context = context[None]
     if context_null.ndim == 2:
@@ -56,18 +56,17 @@ def sample_s2v(
         t_arr = mx.array([t])
         noisy_target = latent[:, :-k]                                    # [16, F, h, w]
         
-        # Add batch dimension [1, 16, F+K, h, w] for mlx_video
-        inp_refs = mx.concatenate([noisy_target, refs], axis=1)[None]   
-        inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)[None]
+        # Concatenate noisy target and clean/zero refs into [16, F+K, h, w]
+        inp_refs = mx.concatenate([noisy_target, refs], axis=1)
+        inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)
 
-        # DiT calls return batch output [1, 16, F+K, h, w]; index [0] squeezes batch dim -> [16, F+K, h, w]
         pos_it = DIT.forward(model, inp_refs, t_arr, context, rope, seq_len)[0]
         pos_i = DIT.forward(model, inp_refs, t_arr, context_null, rope, seq_len)[0]
         neg = DIT.forward(model, inp_zero, t_arr, context_null, rope, seq_len)[0]
 
         noise_pred = neg + guide_img * (pos_i - neg) + guide_text * (pos_it - pos_i)
         
-        # Pass 5D latents to scheduler step: [1, 16, F+K, h, w]
+        # Step latent through scheduler
         latent = sched.step(noise_pred[None], t, latent[None]).squeeze(0)
         mx.eval(latent)                                                 # Metal cmd-buffer boundary
         
