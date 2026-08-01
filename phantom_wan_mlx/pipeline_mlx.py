@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from .config import PhantomWanConfig
+from .model import dit as DIT
 from .model.reference import encode_references
 from .sampling import sample_s2v
 from .utils import weights as W
@@ -103,23 +104,17 @@ class TeaCacheContext:
         return True
 
 
-def apply_teacache_to_model(model, teacache_thresh: float, steps: int):
-    """Hooks TeaCache context into the DiT Transformer forward pass."""
+def apply_teacache_to_dit(teacache_thresh: float, steps: int):
+    """Hooks TeaCache into DIT.forward cleanly without altering internal model tensors."""
     tc = TeaCacheContext(threshold=teacache_thresh)
     tc.reset(steps)
-    model.teacache = tc
     
-    orig_forward = model.__call__ if hasattr(model, "__call__") else getattr(model, "forward", None)
+    orig_dit_forward = DIT.forward
 
-    def teacache_forward(self, x, t, context=None, **kwargs):
-        if not hasattr(self, "teacache") or self.teacache is None:
-            return orig_forward(x, t, context=context, **kwargs)
-
-        tc = self.teacache
+    def teacache_dit_forward(model, inp, t, context, rope_cos_sin, seq_len, cross_kv_caches=None):
         is_even = (tc.cnt % 2 == 0)
-        
-        # Calculate time condition vector
         time_emb = t if isinstance(t, mx.array) else mx.array([t])
+        
         compute = tc.should_compute(time_emb, is_even)
         tc.cnt += 1
 
@@ -128,16 +123,19 @@ def apply_teacache_to_model(model, teacache_thresh: float, steps: int):
             if cached_res is not None:
                 return cached_res
 
-        out = orig_forward(x, t, context=context, **kwargs)
+        out = orig_dit_forward(
+            model, inp, t, context, rope_cos_sin, seq_len, cross_kv_caches=cross_kv_caches
+        )
+
         if is_even:
             tc.prev_res_even = out
         else:
             tc.prev_res_odd = out
-            
+
         return out
 
-    model.__call__ = types.MethodType(teacache_forward, model)
-    return tc
+    DIT.forward = teacache_dit_forward
+    return tc, orig_dit_forward
 
 
 def encode_prompt(prompt: str, phantom_pth=None):
@@ -171,46 +169,53 @@ def s2v(prompt: str, reference_images: list, output_path: str,
     cfg_run = PhantomWanConfig.s2v_1_3b()
     model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
 
-    # Enable TeaCache dynamically if threshold > 0
+    # Enable TeaCache cleanly at the DIT wrapper level
     tc_context = None
+    orig_dit_forward = None
     if teacache_thresh > 0.0:
         if verbose:
             print(f"[TeaCache] Enabling feature caching with threshold={teacache_thresh}", flush=True)
-        tc_context = apply_teacache_to_model(model, teacache_thresh, steps)
+        tc_context, orig_dit_forward = apply_teacache_to_dit(teacache_thresh, steps)
 
-    # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
-    # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
-    # encode_prompt() + docs/development/swift-port-concerns.md.
-    if precomputed_context is not None:
-        ctx = precomputed_context
-        ctx_null = precomputed_context_null if precomputed_context_null is not None else precomputed_context
-    else:
-        t5, tok = W.load_umt5(cfg)
-        ctx = W.encode_text(t5, tok, prompt, cfg.text_len)
-        ctx_null = W.encode_text(t5, tok, NEG_PROMPT, cfg.text_len)
-        del t5
+    try:
+        # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
+        # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
+        # encode_prompt() + docs/development/swift-port-concerns.md.
+        if precomputed_context is not None:
+            ctx = precomputed_context
+            ctx_null = precomputed_context_null if precomputed_context_null is not None else precomputed_context
+        else:
+            t5, tok = W.load_umt5(cfg)
+            ctx = W.encode_text(t5, tok, prompt, cfg.text_len)
+            ctx_null = W.encode_text(t5, tok, NEG_PROMPT, cfg.text_len)
+            del t5
 
-    # reference latents (encoder VAE)
-    enc = W.load_wan_vae(vae_pth, encoder=True)
-    refs = [Image.open(p) for p in reference_images]
-    ref_lat = encode_references(enc, refs, w_px, h_px)
-    del enc
+        # reference latents (encoder VAE)
+        enc = W.load_wan_vae(vae_pth, encoder=True)
+        refs = [Image.open(p) for p in reference_images]
+        ref_lat = encode_references(enc, refs, w_px, h_px)
+        del enc
 
-    # target latent grid
-    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1     # temporal stride 4
-    h_lat, w_lat = h_px // cfg_run.vae_stride[1], w_px // cfg_run.vae_stride[2]
-    if verbose:
-        print(f"f_latent={f_latent} (={frame_num} frames) grid {h_lat}x{w_lat}, K={ref_lat.shape[2]} refs", flush=True)
+        # target latent grid
+        f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1     # temporal stride 4
+        h_lat, w_lat = h_px // cfg_run.vae_stride[1], w_px // cfg_run.vae_stride[2]
+        if verbose:
+            print(f"f_latent={f_latent} (={frame_num} frames) grid {h_lat}x{w_lat}, K={ref_lat.shape[2]} refs", flush=True)
 
-    x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
-                    steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                    seed=seed, verbose=verbose)
-    
-    if tc_context is not None and verbose:
-        skipped = tc_context.skipped_steps
-        total = tc_context.total_evals
-        speedup = total / (total - skipped) if (total - skipped) > 0 else 1.0
-        print(f"[TeaCache] Skipped {skipped}/{total} step evaluations (~{speedup:.2f}x speedup)", flush=True)
+        x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                        steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                        seed=seed, verbose=verbose)
+
+        if tc_context is not None and verbose:
+            skipped = tc_context.skipped_steps
+            total = tc_context.total_evals
+            speedup = total / (total - skipped) if (total - skipped) > 0 else 1.0
+            print(f"[TeaCache] Skipped {skipped}/{total} step evaluations (~{speedup:.2f}x speedup)", flush=True)
+
+    finally:
+        # Restore original DIT forward function state
+        if orig_dit_forward is not None:
+            DIT.forward = orig_dit_forward
 
     del model
 
