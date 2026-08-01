@@ -5,29 +5,19 @@ import math
 import mlx.core as mx
 
 
-def get_schedule(steps: int, shift: float = 5.0) -> list[float]:
-    """Flow matching timestep schedule with exponential shift."""
-    timesteps = [1.0 - i / steps for i in range(steps)]
-    shifted_timesteps = []
-    for t in timesteps:
-        if t == 0:
-            shifted_timesteps.append(0.0)
-        else:
-            s_t = (shift * t) / (1.0 + (shift - 1.0) * t)
-            shifted_timesteps.append(s_t)
-    return shifted_timesteps
-
-
 def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_lat: int,
                steps: int = 50, shift: float = 5.0, guide_img: float = 5.0, guide_text: float = 7.5,
                seed: int = 0, verbose: bool = True, teacache_thresh: float = 0.0):
     """Sample S2V latent using Flow Matching with dual CFG and TeaCache support."""
     mx.random.seed(seed)
     
-    # Latent noise initialization
-    z = mx.random.normal((cfg.in_dim, f_latent, h_lat, w_lat), dtype=mx.bfloat16)
+    # Latent noise initialization: [1, in_dim, f_latent, h_lat, w_lat] or [in_dim, f_latent, h_lat, w_lat]
+    # Match the shape expected by model forward
+    z = mx.random.normal((1, cfg.in_dim, f_latent, h_lat, w_lat), dtype=mx.bfloat16)
     
-    timesteps = get_schedule(steps, shift=shift)
+    # Generate schedule
+    timesteps = [1.0 - i / steps for i in range(steps)]
+    shifted_timesteps = [(shift * t) / (1.0 + (shift - 1.0) * t) if t > 0 else 0.0 for t in timesteps]
     
     # TeaCache tracking state
     accumulated_l1 = 0.0
@@ -38,14 +28,17 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
     if verbose and teacache_thresh > 0.0:
         print(f"[TeaCache MLX] Enabled with threshold: {teacache_thresh}")
 
-    for i in range(len(timesteps) - 1):
-        t_curr = timesteps[i]
-        t_next = timesteps[i + 1]
+    for i in range(len(shifted_timesteps) - 1):
+        t_curr = shifted_timesteps[i]
+        t_next = shifted_timesteps[i + 1]
         dt = t_next - t_curr
+
+        # Convert float timestep to array for MLX model call
+        t_arr = mx.array([t_curr * 1000.0], dtype=mx.float32)
 
         should_calc = True
 
-        # Check relative L1 threshold against previous step input
+        # Check TeaCache L1 threshold
         if teacache_thresh > 0.0 and prev_input is not None:
             l1_diff = mx.mean(mx.abs(z - prev_input)) / (mx.mean(mx.abs(prev_input)) + 1e-6)
             mx.eval(l1_diff)
@@ -57,27 +50,29 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
         if should_calc:
             accumulated_l1 = 0.0
 
-            # Forward pass: unconditional, text-only, and joint text+image guidance
-            # 1. Full context (Text + Reference Image)
-            v_cond = model(z, t=t_curr, context=ctx, ref_latents=ref_lat)
+            # --- Forward Pass Calls ---
+            # 1. Joint Subject + Text Pass (pass ref_lat as secondary positional or ref arg)
+            if ref_lat is not None:
+                v_cond = model(z, t_arr, ctx, ref_lat)
+            else:
+                v_cond = model(z, t_arr, ctx)
             
-            # 2. Text-guided CFG (Null references)
-            if guide_img != 1.0:
-                v_text = model(z, t=t_curr, context=ctx, ref_latents=None)
+            # 2. Text-only Guidance Pass
+            if guide_img != 1.0 and ref_lat is not None:
+                v_text = model(z, t_arr, ctx)
             else:
                 v_text = v_cond
                 
-            # 3. Unconditional CFG (Null context + Null references)
+            # 3. Unconditional Guidance Pass
             if guide_text != 1.0:
-                v_uncond = model(z, t=t_curr, context=ctx_null, ref_latents=None)
+                v_uncond = model(z, t_arr, ctx_null)
             else:
                 v_uncond = v_text
 
-            # Compute dual-guided velocity output
+            # Compute dual CFG guidance prediction
             v_pred = v_uncond + guide_text * (v_text - v_uncond) + guide_img * (v_cond - v_text)
             mx.eval(v_pred)
 
-            # Store velocity output for residual prediction
             cached_residual = v_pred
         else:
             skipped_steps += 1
@@ -85,12 +80,16 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
 
         prev_input = z
 
-        # Euler step update
+        # Step update
         z = z + v_pred * dt
 
     if verbose and teacache_thresh > 0.0:
-        total_steps = len(timesteps) - 1
+        total_steps = len(shifted_timesteps) - 1
         speedup = total_steps / max(1, total_steps - skipped_steps)
         print(f"[TeaCache MLX] Skipped {skipped_steps}/{total_steps} steps (~{speedup:.2f}x speedup)")
+
+    # Squeeze batch dim if needed by VAE decode
+    if z.ndim == 5 and z.shape[0] == 1:
+        z = z[0]
 
     return z
