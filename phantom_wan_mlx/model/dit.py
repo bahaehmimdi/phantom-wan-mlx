@@ -22,59 +22,12 @@ def prepare_grid(model, t_latent: int, h_latent: int, w_latent: int, patch_size,
     return rope_cos_sin, seq_len
 
 
-def forward(
-    model,
-    x: mx.array,
-    t: mx.array,
-    context: mx.array,
-    rope=None,
-    seq_len: int = None,
-    teacache=None,
-    teacache_mode: str = "default",
-):
-    """DiT forward wrapper fixing patchify channel alignment [1, 16, F, H, W]."""
-    
-    # 1. Format input tensor x strictly to 5D [1, 16, F, H, W]
-    if x.ndim == 4:
-        # x is [16, F, H, W] -> add batch dimension [1, 16, F, H, W]
-        x_in = x[None]
-    elif x.ndim == 5 and x.shape[2] == 16:
-        # If shape is [1, F, 16, H, W], transpose back to [1, 16, F, H, W]
-        x_in = mx.transpose(x, (0, 2, 1, 3, 4))
-    else:
-        x_in = x
+def forward(model, latent_cfhw, t, context, rope_cos_sin, seq_len, cross_kv_caches=None):
+    """One DiT forward over an assembled [C, F+K, H, W] latent (list-as-batch).
 
-    # 2. Text projection / text embedder check
-    ctx_in = context
-    if hasattr(model, "text_embedder") and context.shape[-1] == 4096:
-        ctx_in = model.text_embedder(context)
-    elif hasattr(model, "text_embedding") and context.shape[-1] == 4096:
-        ctx_in = model.text_embedding(context)
-
-    if ctx_in.ndim == 2:
-        ctx_in = ctx_in[None]
-
-    if teacache is not None:
-        should_skip, cached_output = teacache.should_skip(
-            model=model, x=x_in, t=t, context=ctx_in, mode=teacache_mode
-        )
-        if should_skip:
-            return cached_output
-
-    # 3. Model call using grid arguments if accepted by mlx_video Wan2.1
-    # Check if model accepts seq_len or rope
-    try:
-        out = model(x_in, t=t, context=ctx_in, seq_len=seq_len)
-    except TypeError:
-        out = model(x_in, t=t, context=ctx_in)
-
-    # 4. Squeeze batch dimension to return [16, F, H, W] back to sample_s2v
-    if out.ndim == 5:
-        out_ret = out.squeeze(0)
-    else:
-        out_ret = out
-
-    if teacache is not None:
-        teacache.update_cache(out_ret, mode=teacache_mode)
-
-    return out_ret
+    latent_cfhw: list of [C, F+K, H, W] (one per batch element), OR a single [C,F+K,H,W].
+    Returns list of [C, F+K, H, W] predicted velocities.
+    """
+    x_list = latent_cfhw if isinstance(latent_cfhw, list) else [latent_cfhw]
+    ctx = context if isinstance(context, list) else [context]
+    return model(x_list, t, ctx, seq_len, cross_kv_caches=cross_kv_caches, rope_cos_sin=rope_cos_sin)
