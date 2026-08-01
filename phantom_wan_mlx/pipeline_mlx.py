@@ -1,7 +1,7 @@
 """Phantom-Wan S2V inference entry (MLX).
 
     from phantom_wan_mlx import pipeline_mlx as P
-    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", teacache_thresh=0.12)
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", teacache_thresh=0.10)
 
 reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
 """
@@ -27,7 +27,9 @@ NEG_PROMPT = (
 
 
 def encode_prompt(prompt: str, phantom_pth=None):
-    """Offline umT5 encode → [L, 4096] context."""
+    """Offline umT5 encode → [L, 4096] context. For the Swift escape hatch: encode prompts
+    in Python, save the embeddings, pass them to a Swift consumer via precomputed_context
+    (bypasses the ftfy cleaner + SentencePiece tokenizer + 11 GB umT5 at Swift runtime)."""
     _, cfg = W.load_phantom_dit(phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth")
     t5, tok = W.load_umt5(cfg)
     return W.encode_text(t5, tok, prompt, cfg.text_len)
@@ -35,6 +37,7 @@ def encode_prompt(prompt: str, phantom_pth=None):
 
 def _save_video(frames_bchw, path, fps=16):
     import imageio
+    # frames_bchw: mx [1,3,T,H,W] in [-1,1] -> uint8 list
     v = ((np.array(frames_bchw[0]).transpose(1, 2, 3, 0) + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
     imageio.mimsave(path, list(v), fps=fps, quality=8)
     return path
@@ -50,16 +53,16 @@ def s2v(prompt: str, reference_images: list, output_path: str,
     
     Args:
         teacache_thresh (float): TeaCache relative L1 threshold. Set to 0.0 to disable.
-                                 Recommended values: 0.08–0.12 for 1.3B, 0.15–0.25 for 14B.
+                                 Recommended range for 1.3B: 0.08 - 0.12.
     """
     w_px, h_px = size
     phantom_pth = phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth"
     vae_pth = vae_pth or ROOT / "weights/wan-base/Wan2.1_VAE.pth"
 
     cfg_run = PhantomWanConfig.s2v_1_3b()
-    model, cfg = W.load_phantom_dit(phantom_pth)
+    model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
 
-    # text context
+    # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
     if precomputed_context is not None:
         ctx = precomputed_context
         ctx_null = precomputed_context_null if precomputed_context_null is not None else precomputed_context
@@ -69,45 +72,25 @@ def s2v(prompt: str, reference_images: list, output_path: str,
         ctx_null = W.encode_text(t5, tok, NEG_PROMPT, cfg.text_len)
         del t5
 
-    # reference latents
+    # reference latents (encoder VAE)
     enc = W.load_wan_vae(vae_pth, encoder=True)
     refs = [Image.open(p) for p in reference_images]
     ref_lat = encode_references(enc, refs, w_px, h_px)
     del enc
 
     # target latent grid
-    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1
+    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1     # temporal stride 4
     h_lat, w_lat = h_px // cfg_run.vae_stride[1], w_px // cfg_run.vae_stride[2]
     if verbose:
         print(f"f_latent={f_latent} (={frame_num} frames) grid {h_lat}x{w_lat}, K={ref_lat.shape[2]} refs", flush=True)
 
-    # --- TeaCache execution wrapper ---
-    if teacache_thresh > 0.0:
-        try:
-            from mlx_teacache import apply_teacache
-            if verbose:
-                print(f"[TeaCache] Enabled with threshold: {teacache_thresh}")
-            with apply_teacache(model, rel_l1_thresh=teacache_thresh) as handle:
-                x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
-                                steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                                seed=seed, verbose=verbose, teacache_thresh=teacache_thresh)
-            if verbose and hasattr(handle, "stats"):
-                print(f"[TeaCache] Skipped steps: {handle.stats.skipped_count}, "
-                      f"Estimated speedup: {handle.stats.speedup_estimate:.2f}x")
-        except ImportError:
-            if verbose:
-                print("[TeaCache Warning] `mlx-teacache` not installed, passing `teacache_thresh` directly to sample_s2v.")
-            x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
-                            steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                            seed=seed, verbose=verbose, teacache_thresh=teacache_thresh)
-    else:
-        x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
-                        steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                        seed=seed, verbose=verbose)
-
+    # Core sampling loop call with teacache_thresh passed directly
+    x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                    steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                    seed=seed, verbose=verbose, teacache_thresh=teacache_thresh)
     del model
 
-    # decode
+    # decode — streaming (lossless, flat memory) unblocks long video; whole-seq OOMs >~49 frames
     dec = W.load_wan_vae(vae_pth, encoder=False)
     if lossless_decode:
         from .streaming_decode import decode_streaming
