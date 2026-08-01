@@ -1,31 +1,15 @@
 """Phantom-Wan S2V inference entry (MLX).
 
-Examples:
     from phantom_wan_mlx import pipeline_mlx as P
-
-    # Standard usage without LoRA:
-    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4")
-
-    # With a single LoRA:
-    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", loras="style.safetensors", lora_scale=0.8)
-
-    # With multiple LoRAs (with individual weights):
-    P.s2v(
-        "two friends walking", 
-        ["a.png", "b.png"], 
-        "out.mp4", 
-        loras=[("style.safetensors", 0.8), ("character.safetensors", 0.5)]
-    )
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", teacache_thresh=0.12)
 
 reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence, Union, Tuple
 
 import mlx.core as mx
-import mlx.utils as utils
 import numpy as np
 from PIL import Image
 
@@ -41,79 +25,9 @@ NEG_PROMPT = (
     "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 
-# Type alias for flexible multi-LoRA inputs
-LoraInput = Union[
-    str, 
-    Path, 
-    Tuple[Union[str, Path], float], 
-    Sequence[Union[str, Path, Tuple[Union[str, Path], float]]]
-]
-
-
-def _apply_loras(model, loras: LoraInput, default_scale: float = 1.0, verbose: bool = True):
-    """Fuses one or multiple LoRA weights directly into the MLX DiT parameters in-place."""
-    if not loras:
-        return
-
-    # Normalize input into a standard list of (Path, scale) tuples
-    lora_list: list[tuple[Path, float]] = []
-    if isinstance(loras, (str, Path)):
-        lora_list.append((Path(loras), default_scale))
-    elif isinstance(loras, tuple) and len(loras) == 2:
-        lora_list.append((Path(loras[0]), float(loras[1])))
-    elif isinstance(loras, (list, tuple)):
-        for item in loras:
-            if isinstance(item, (str, Path)):
-                lora_list.append((Path(item), default_scale))
-            elif isinstance(item, (list, tuple)) and len(item) == 2:
-                lora_list.append((Path(item[0]), float(item[1])))
-
-    # Retrieve current model parameters using mlx.utils
-    flat_params = utils.tree_flatten(model.parameters())
-    param_dict = dict(flat_params)
-    accumulated_deltas: dict[str, mx.array] = {}
-
-    for lora_path, scale in lora_list:
-        if verbose:
-            print(f"[LoRA] Injecting weights from {lora_path.name} (scale={scale})...", flush=True)
-
-        lora_weights = mx.load(str(lora_path))
-
-        for name, p in param_dict.items():
-            delta = None
-
-            # Case A: Exact parameter key match (pre-fused delta format)
-            if name in lora_weights:
-                delta = scale * lora_weights[name]
-
-            # Case B: Standard decomposed LoRA matrices (lora_up / lora_down)
-            else:
-                base_key = name.rsplit(".", 1)[0]  # Strip '.weight'
-                up_key = f"{base_key}.lora_up.weight"
-                down_key = f"{base_key}.lora_down.weight"
-
-                if up_key in lora_weights and down_key in lora_weights:
-                    down_w = lora_weights[down_key]
-                    up_w = lora_weights[up_key]
-                    delta = (up_w @ down_w) * scale
-
-            # Accumulate deltas across multiple LoRAs
-            if delta is not None:
-                if name in accumulated_deltas:
-                    accumulated_deltas[name] = accumulated_deltas[name] + delta
-                else:
-                    accumulated_deltas[name] = delta
-
-    # Update model tree parameters in-place
-    if accumulated_deltas:
-        updates = [(name, param_dict[name] + accumulated_deltas[name]) for name in accumulated_deltas]
-        model.update(utils.tree_unflatten(updates))
-
 
 def encode_prompt(prompt: str, phantom_pth=None):
-    """Offline umT5 encode → [L, 4096] context. For the Swift escape hatch: encode prompts
-    in Python, save the embeddings, pass them to a Swift consumer via precomputed_context
-    (bypasses the ftfy cleaner + SentencePiece tokenizer + 11 GB umT5 at Swift runtime)."""
+    """Offline umT5 encode → [L, 4096] context."""
     _, cfg = W.load_phantom_dit(phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth")
     t5, tok = W.load_umt5(cfg)
     return W.encode_text(t5, tok, prompt, cfg.text_len)
@@ -121,7 +35,6 @@ def encode_prompt(prompt: str, phantom_pth=None):
 
 def _save_video(frames_bchw, path, fps=16):
     import imageio
-    # frames_bchw: mx [1,3,T,H,W] in [-1,1] -> uint8 list
     v = ((np.array(frames_bchw[0]).transpose(1, 2, 3, 0) + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
     imageio.mimsave(path, list(v), fps=fps, quality=8)
     return path
@@ -130,24 +43,23 @@ def _save_video(frames_bchw, path, fps=16):
 def s2v(prompt: str, reference_images: list, output_path: str,
         size=(832, 480), frame_num: int = 81, steps: int = 50, shift: float = 5.0,
         guide_img: float = 5.0, guide_text: float = 7.5, seed: int = 0,
-        phantom_pth=None, vae_pth=None,
-        loras: LoraInput | None = None, lora_scale: float = 1.0,
-        lossless_decode: bool = True, precomputed_context=None, precomputed_context_null=None, verbose: bool = True):
-    """Generate a subject-consistent video from a prompt + reference images."""
+        phantom_pth=None, vae_pth=None, lossless_decode: bool = True,
+        precomputed_context=None, precomputed_context_null=None, verbose: bool = True,
+        teacache_thresh: float = 0.0):
+    """Generate a subject-consistent video from a prompt + reference images.
+    
+    Args:
+        teacache_thresh (float): TeaCache relative L1 threshold. Set to 0.0 to disable.
+                                 Recommended values: 0.08–0.12 for 1.3B, 0.15–0.25 for 14B.
+    """
     w_px, h_px = size
     phantom_pth = phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth"
     vae_pth = vae_pth or ROOT / "weights/wan-base/Wan2.1_VAE.pth"
 
     cfg_run = PhantomWanConfig.s2v_1_3b()
-    model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
+    model, cfg = W.load_phantom_dit(phantom_pth)
 
-    # Multi-LoRA dynamic injection
-    if loras is not None:
-        _apply_loras(model, loras, default_scale=lora_scale, verbose=verbose)
-
-    # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
-    # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
-    # encode_prompt() + docs/development/swift-port-concerns.md.
+    # text context
     if precomputed_context is not None:
         ctx = precomputed_context
         ctx_null = precomputed_context_null if precomputed_context_null is not None else precomputed_context
@@ -157,24 +69,45 @@ def s2v(prompt: str, reference_images: list, output_path: str,
         ctx_null = W.encode_text(t5, tok, NEG_PROMPT, cfg.text_len)
         del t5
 
-    # reference latents (encoder VAE)
+    # reference latents
     enc = W.load_wan_vae(vae_pth, encoder=True)
     refs = [Image.open(p) for p in reference_images]
     ref_lat = encode_references(enc, refs, w_px, h_px)
     del enc
 
     # target latent grid
-    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1     # temporal stride 4
+    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1
     h_lat, w_lat = h_px // cfg_run.vae_stride[1], w_px // cfg_run.vae_stride[2]
     if verbose:
         print(f"f_latent={f_latent} (={frame_num} frames) grid {h_lat}x{w_lat}, K={ref_lat.shape[2]} refs", flush=True)
 
-    x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
-                    steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                    seed=seed, verbose=verbose)
+    # --- TeaCache execution wrapper ---
+    if teacache_thresh > 0.0:
+        try:
+            from mlx_teacache import apply_teacache
+            if verbose:
+                print(f"[TeaCache] Enabled with threshold: {teacache_thresh}")
+            with apply_teacache(model, rel_l1_thresh=teacache_thresh) as handle:
+                x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                                steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                                seed=seed, verbose=verbose, teacache_thresh=teacache_thresh)
+            if verbose and hasattr(handle, "stats"):
+                print(f"[TeaCache] Skipped steps: {handle.stats.skipped_count}, "
+                      f"Estimated speedup: {handle.stats.speedup_estimate:.2f}x")
+        except ImportError:
+            if verbose:
+                print("[TeaCache Warning] `mlx-teacache` not installed, passing `teacache_thresh` directly to sample_s2v.")
+            x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                            steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                            seed=seed, verbose=verbose, teacache_thresh=teacache_thresh)
+    else:
+        x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                        steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                        seed=seed, verbose=verbose)
+
     del model
 
-    # decode — streaming (lossless, flat memory) unblocks long video; whole-seq OOMs >~49 frames
+    # decode
     dec = W.load_wan_vae(vae_pth, encoder=False)
     if lossless_decode:
         from .streaming_decode import decode_streaming
