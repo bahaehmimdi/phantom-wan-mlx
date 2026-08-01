@@ -22,12 +22,37 @@ def prepare_grid(model, t_latent: int, h_latent: int, w_latent: int, patch_size,
     return rope_cos_sin, seq_len
 
 
-def forward(model, latent_cfhw, t, context, rope_cos_sin, seq_len, cross_kv_caches=None):
-    """One DiT forward over an assembled [C, F+K, H, W] latent (list-as-batch).
-
-    latent_cfhw: list of [C, F+K, H, W] (one per batch element), OR a single [C,F+K,H,W].
-    Returns list of [C, F+K, H, W] predicted velocities.
+def forward(
+    model,
+    x: mx.array,
+    t: mx.array,
+    context: mx.array,
+    rope,
+    seq_len: int,
+    teacache=None,
+    teacache_mode: str = "default",
+):
     """
-    x_list = latent_cfhw if isinstance(latent_cfhw, list) else [latent_cfhw]
-    ctx = context if isinstance(context, list) else [context]
-    return model(x_list, t, ctx, seq_len, cross_kv_caches=cross_kv_caches, rope_cos_sin=rope_cos_sin)
+    DiT forward wrapper supporting optional TeaCache state handling.
+    """
+    # If using TeaCache, compute features / evaluate L1 distance before main blocks
+    if teacache is not None:
+        # Check if we can skip block execution using cached residual/output
+        should_skip, cached_output = teacache.should_skip(
+            model=model,
+            x=x,
+            t=t,
+            context=context,
+            mode=teacache_mode
+        )
+        if should_skip:
+            return cached_output
+
+    # Run regular forward pass if not skipped
+    out = model(x, t=t, context=context, rope=rope, seq_len=seq_len)
+
+    # Store state/output in TeaCache for current mode stream
+    if teacache is not None:
+        teacache.update_cache(out, mode=teacache_mode)
+
+    return out
