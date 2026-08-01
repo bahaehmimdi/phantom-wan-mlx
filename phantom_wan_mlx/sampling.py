@@ -12,7 +12,7 @@ def sample_s2v(
     context: mx.array,            # text embedding [1, seq, 4096]
     context_null: mx.array,       # null/neg-prompt embedding [1, seq, 4096]
     cfg,                          # PhantomWanConfig / WanModelConfig (patch_size)
-    f_latent: int,                # F target latent frames (e.g. 21)
+    f_latent: int,                # F target latent frames (21)
     h_latent: int,                # 32
     w_latent: int,                # 64
     steps: int = 50,
@@ -29,9 +29,8 @@ def sample_s2v(
     refs_neg = mx.zeros_like(refs)
     patch = getattr(cfg, "patch_size", (1, 2, 2))
 
-    # Calculate total sequence grid (21 target + 2 refs = 23 frames)
     rope, seq_len = DIT.prepare_grid(model, f_latent + k, h_latent, w_latent, patch)
-    
+
     sched = FlowUniPCScheduler(num_train_timesteps=getattr(cfg, "num_train_timesteps", 1000))
     sched.set_timesteps(steps, shift=shift)
 
@@ -47,7 +46,7 @@ def sample_s2v(
         t_arr = mx.array([t])
         noisy_target = latent[:, :-k]                                    # [16, 21, 32, 64]
         
-        # Format 5D Tensors: [1, 16, 23, 32, 64]
+        # 5D Tensors [1, 16, 23, 32, 64]
         inp_refs = mx.concatenate([noisy_target, refs], axis=1)[None]   
         inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)[None]
 
@@ -63,4 +62,4 @@ def sample_s2v(
         if verbose:
             print(f"  step {i + 1}/{steps}", flush=True)
 
-    return latent[:, :-k]                                               # strip ref tail -> [16, F, h, w]
+    return latent[:, :-k]                                               # strip reference frames -> [16, 21, 32, 64]
