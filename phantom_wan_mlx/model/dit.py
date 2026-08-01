@@ -32,22 +32,28 @@ def forward(
     teacache=None,
     teacache_mode: str = "default",
 ):
-    """DiT forward wrapper compatible with WanModel and TeaCache."""
+    """DiT forward wrapper with 5D batch expansion for WanModel."""
+    
+    # 1. Ensure 5D tensor shape [1, C, F, H, W] for mlx_video
+    x_in = x[None] if x.ndim == 4 else x
+
     if teacache is not None:
         should_skip, cached_output = teacache.should_skip(
-            model=model, x=x, t=t, context=context, mode=teacache_mode
+            model=model, x=x_in, t=t, context=context, mode=teacache_mode
         )
         if should_skip:
             return cached_output
 
-    # Drop 'rope' from the direct model call as WanModel computes/uses it internally
-    # Pass seq_len if required by WanModel.__call__, otherwise pass x, t, context
-    if seq_len is not None:
-        out = model(x, t=t, context=context, seq_len=seq_len)
+    # 2. Forward pass through WanModel
+    out = model(x_in, t=t, context=context, seq_len=seq_len)
+
+    # 3. If model returns 5D [1, C, F, H, W], squeeze batch dim to return 4D [C, F, H, W]
+    if out.ndim == 5 and x.ndim == 4:
+        out_ret = out.squeeze(0)
     else:
-        out = model(x, t=t, context=context)
+        out_ret = out
 
     if teacache is not None:
-        teacache.update_cache(out, mode=teacache_mode)
+        teacache.update_cache(out_ret, mode=teacache_mode)
 
-    return out
+    return out_ret
