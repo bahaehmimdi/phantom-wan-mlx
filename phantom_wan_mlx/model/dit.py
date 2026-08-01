@@ -27,31 +27,24 @@ def forward(
     x: mx.array,
     t: mx.array,
     context: mx.array,
-    rope,
-    seq_len: int,
+    rope=None,
+    seq_len: int = None,
     teacache=None,
     teacache_mode: str = "default",
 ):
-    """
-    DiT forward wrapper supporting optional TeaCache state handling.
-    """
-    # If using TeaCache, compute features / evaluate L1 distance before main blocks
+    """DiT forward wrapper matching WanModel interface."""
+    
     if teacache is not None:
-        # Check if we can skip block execution using cached residual/output
         should_skip, cached_output = teacache.should_skip(
-            model=model,
-            x=x,
-            t=t,
-            context=context,
-            mode=teacache_mode
+            model=model, x=x, t=t, context=context, mode=teacache_mode
         )
         if should_skip:
             return cached_output
 
-    # Run regular forward pass if not skipped
-    out = model(x, t=t, context=context, rope=rope, seq_len=seq_len)
+    # Drop 'rope' keyword argument when invoking model()
+    # Pass seq_len or grid context as supported by WanModel
+    out = model(x, t=t, context=context, seq_len=seq_len)
 
-    # Store state/output in TeaCache for current mode stream
     if teacache is not None:
         teacache.update_cache(out, mode=teacache_mode)
 
