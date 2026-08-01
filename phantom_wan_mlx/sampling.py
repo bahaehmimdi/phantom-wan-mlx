@@ -32,8 +32,9 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
         t_next = shifted_timesteps[i + 1]
         dt = t_next - t_curr
 
-        # FIX: mlx_video WanModel expects t as a scalar (float), NOT an mx.array!
-        t_val = float(t_curr * 1000.0)
+        # FIX: mlx_video WanModel requires t as an 1D MLX array of shape (1,)
+        # Note: If your weights expect 0..1000 range, use t_curr * 1000.0
+        t_arr = mx.array([t_curr], dtype=mx.float32)
 
         should_calc = True
 
@@ -52,19 +53,19 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
             # --- Forward Pass Calls ---
             # 1. Joint Subject + Text Pass
             if ref_lat is not None:
-                v_cond = model(z, t_val, ctx, ref_lat)
+                v_cond = model(z, t_arr, ctx, ref_lat)
             else:
-                v_cond = model(z, t_val, ctx)
+                v_cond = model(z, t_arr, ctx)
             
             # 2. Text-only Guidance Pass
             if guide_img != 1.0 and ref_lat is not None:
-                v_text = model(z, t_val, ctx)
+                v_text = model(z, t_arr, ctx)
             else:
                 v_text = v_cond
                 
             # 3. Unconditional Guidance Pass
             if guide_text != 1.0:
-                v_uncond = model(z, t_val, ctx_null)
+                v_uncond = model(z, t_arr, ctx_null)
             else:
                 v_uncond = v_text
 
