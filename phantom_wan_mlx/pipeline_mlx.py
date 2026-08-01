@@ -1,7 +1,7 @@
 """Phantom-Wan S2V inference entry (MLX).
 
     from phantom_wan_mlx import pipeline_mlx as P
-    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4", teacache_threshold=0.15)
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4")
 
 reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
 """
@@ -17,7 +17,7 @@ from .config import PhantomWanConfig
 from .model.reference import encode_references
 from .sampling import sample_s2v
 from .utils import weights as W
-print ('V3')
+
 ROOT = Path(__file__).resolve().parents[1]
 NEG_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
@@ -47,28 +47,14 @@ def s2v(prompt: str, reference_images: list, output_path: str,
         size=(832, 480), frame_num: int = 81, steps: int = 50, shift: float = 5.0,
         guide_img: float = 5.0, guide_text: float = 7.5, seed: int = 0,
         phantom_pth=None, vae_pth=None, lossless_decode: bool = True,
-        precomputed_context=None, precomputed_context_null=None, verbose: bool = True,
-        teacache_threshold: float = 0.0):
-    """Generate a subject-consistent video from a prompt + reference images with optional TeaCache."""
+        precomputed_context=None, precomputed_context_null=None, verbose: bool = True):
+    """Generate a subject-consistent video from a prompt + reference images."""
     w_px, h_px = size
     phantom_pth = phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth"
     vae_pth = vae_pth or ROOT / "weights/wan-base/Wan2.1_VAE.pth"
 
     cfg_run = PhantomWanConfig.s2v_1_3b()
     model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
-
-    # Initialize TeaCache instance if threshold > 0.0
-    teacache = None
-    if teacache_threshold > 0.0:
-        from .teacache import TeaCache
-        model_name = "14B" if getattr(cfg, "num_layers", 30) == 40 else "1.3B"
-        teacache = TeaCache(
-            num_inference_steps=steps,
-            model_name=model_name,
-            threshold=teacache_threshold
-        )
-        if verbose:
-            print(f"[TeaCache] Initialized for {model_name} model with threshold={teacache_threshold}", flush=True)
 
     # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
     # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
@@ -96,7 +82,7 @@ def s2v(prompt: str, reference_images: list, output_path: str,
 
     x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
                     steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
-                    seed=seed, verbose=verbose, teacache=teacache)
+                    seed=seed, verbose=verbose)
     del model
 
     # decode — streaming (lossless, flat memory) unblocks long video; whole-seq OOMs >~49 frames
