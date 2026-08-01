@@ -19,7 +19,7 @@ from .model import dit as DIT
 from .model.reference import encode_references
 from .sampling import sample_s2v
 from .utils import weights as W
-
+print('Updated V1')
 ROOT = Path(__file__).resolve().parents[1]
 NEG_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
