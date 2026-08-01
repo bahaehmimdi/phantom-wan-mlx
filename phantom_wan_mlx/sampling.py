@@ -1,14 +1,4 @@
-"""Dual-scale chained CFG sampler for S2V (G1).
-
-Per step, THREE DiT forwards (locked vs subject2video.generate:286-313):
-  pos_it = model(cat[noisy_target, refs],      context=text)
-  pos_i  = model(cat[noisy_target, refs],      context=null)
-  neg    = model(cat[noisy_target, ZERO refs], context=null)
-  noise_pred = neg + w_img*(pos_i - neg) + w_text*(pos_it - pos_i)
-Defaults w_img=5.0, w_text=7.5. Subject-"uncond" = ZEROED ref latent (not dropout).
-Per step the model input re-clamps the ref tail to CLEAN refs; after the loop the K ref
-frames are stripped. Scheduler: mlx-video FlowUniPCScheduler, shift 5.0, 50 steps.
-"""
+"""Dual-scale chained CFG sampler for S2V (G1)."""
 from __future__ import annotations
 
 import mlx.core as mx
@@ -46,7 +36,6 @@ def sample_s2v(
     mx.random.seed(seed)
     latent = mx.random.normal((16, f_latent + k, h_latent, w_latent))   # [16, F+K, h, w]
 
-    # Ensure context tensors carry 3D shape [1, seq, 4096]
     if context.ndim == 2:
         context = context[None]
     if context_null.ndim == 2:
@@ -56,9 +45,9 @@ def sample_s2v(
         t_arr = mx.array([t])
         noisy_target = latent[:, :-k]                                    # [16, F, h, w]
         
-        # Concatenate noisy target and clean/zero refs into [16, F+K, h, w]
-        inp_refs = mx.concatenate([noisy_target, refs], axis=1)
-        inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)
+        # 5D Tensors [1, 16, F+K, h, w]
+        inp_refs = mx.concatenate([noisy_target, refs], axis=1)[None]   
+        inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)[None]
 
         pos_it = DIT.forward(model, inp_refs, t_arr, context, rope, seq_len)[0]
         pos_i = DIT.forward(model, inp_refs, t_arr, context_null, rope, seq_len)[0]
@@ -66,7 +55,6 @@ def sample_s2v(
 
         noise_pred = neg + guide_img * (pos_i - neg) + guide_text * (pos_it - pos_i)
         
-        # Step latent through scheduler
         latent = sched.step(noise_pred[None], t, latent[None]).squeeze(0)
         mx.eval(latent)                                                 # Metal cmd-buffer boundary
         
