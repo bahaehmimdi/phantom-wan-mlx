@@ -11,7 +11,6 @@ def prepare_grid(model, f_total: int, h_latent: int, w_latent: int, patch_size: 
     grid_w = w_latent // patch_size[2]
     seq_len = grid_f * grid_h * grid_w
 
-    # Use model's native rope generator if present
     rope = None
     if hasattr(model, "make_rope"):
         rope = model.make_rope(grid_f, grid_h, grid_w)
@@ -27,24 +26,21 @@ def forward(model, inp, t, ctx, rope_cos_sin, seq_len, cross_kv_caches=None):
     Splits 5D latents [1, 16, F+K, H, W] into target and reference streams,
     patchifies each stream, and forwards the merged sequence tokens.
     """
-    # Squeeze to 4D [16, T, H, W] for patchify processing
     if isinstance(inp, mx.array):
         x_tensor = inp.squeeze(0) if (inp.ndim == 5 and inp.shape[0] == 1) else inp
     else:
         x_tensor = inp
 
-    # Check if we have concatenated target (21) + refs (K)
     if isinstance(x_tensor, mx.array) and x_tensor.ndim == 4 and x_tensor.shape[1] > 21:
         target_lat = x_tensor[:, :21, :, :]     # [16, 21, 32, 64]
         ref_lat = x_tensor[:, 21:, :, :]        # [16, K, 32, 64]
 
-        # Patchify both streams independently via mlx_video _patchify
         if hasattr(model, "_patchify"):
             p_target = model._patchify(target_lat)  # [10752, 1536]
             p_ref = model._patchify(ref_lat)        # [1024, 1536]
             
-            # Combine along token sequence dimension -> [11776, 1536]
-            x_patched = mx.concatenate([p_target, p_ref], axis=0)[None] # [1, 11776, 1536]
+            # Fixed: Use positional argument for axis (axis 0)
+            x_patched = mx.concatenate([p_target, p_ref], 0)[None]  # [1, 11776, 1536]
         else:
             x_patched = x_tensor[None]
     else:
