@@ -47,7 +47,7 @@ def forward(model, inp, t, ctx, rope_cos_sin, seq_len, cross_kv_caches=None):
         
         model._patchify = safe_patchify
 
-    try抓:
+    try:
         out = model(
             x_in,
             t,
