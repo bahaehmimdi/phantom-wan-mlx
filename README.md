@@ -34,7 +34,7 @@ P.s2v(
     "two friends walking together in a park",
     ["subjectA.png", "subjectB.png"],
     "out.mp4",
-    size=(832, 480), frame_num=81, steps=50,
+    size=(832, 480), frame_num=81, steps=50,   teacache_threshold=0.15,
 )
 ```
 
