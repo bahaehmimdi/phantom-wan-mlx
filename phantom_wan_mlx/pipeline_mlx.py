@@ -1,42 +1,56 @@
-import time
-import os
+"""Phantom-Wan S2V inference entry (MLX).
+
+    from phantom_wan_mlx import pipeline_mlx as P
+    P.s2v("two friends walking", ["a.png", "b.png"], "out.mp4")
+
+reference_images: list of paths (multi-subject <=4, each a distinct subject). See G1.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+import types
+
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
+
+from .config import PhantomWanConfig
+from .model.reference import encode_references
+from .sampling import sample_s2v
+from .utils import weights as W
+
+ROOT = Path(__file__).resolve().parents[1]
+NEG_PROMPT = (
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
+    "低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，"
+    "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+)
 
 
 class TeaCacheContext:
-    """
-    Context manager and controller for dynamic feature caching (TeaCache) in MLX.
-    Tracks relative L1 distance between steps to skip redundant Transformer evaluations.
-    """
-    def __init__(self, threshold=0.15, ret_steps=5, coefficients=None):
+    """Dynamic feature caching context (TeaCache) for MLX DiT Transformer models."""
+    def __init__(self, threshold: float = 0.15, ret_steps: int = 5):
         self.threshold = threshold
         self.ret_steps = ret_steps
-        # Poly coefficients calibrated for Wan DiT dynamics
-        self.coefficients = coefficients or [-23.94, 27.31, -0.49, 0.04]
-        self.rescale_func = np.poly1d(self.coefficients)
+        self.coefficients = [-23.9411516, 27.3094821, -0.493836371, 0.0425192456]
+        self.poly_rescale = np.poly1d(self.coefficients)
         
         self.cnt = 0
         self.num_steps = 0
-        self.accumulated_distance_even = 0.0
-        self.accumulated_distance_odd = 0.0
+        self.accumulated_dist_even = 0.0
+        self.accumulated_dist_odd = 0.0
         self.prev_emb_even = None
         self.prev_emb_odd = None
         self.prev_res_even = None
         self.prev_res_odd = None
-        
-        # Metrics tracking
         self.skipped_steps = 0
         self.total_evals = 0
 
-    def reset(self, total_steps):
+    def reset(self, steps: int):
         self.cnt = 0
-        self.num_steps = total_steps * 2  # cond + uncond per timestep
-        self.accumulated_distance_even = 0.0
-        self.accumulated_distance_odd = 0.0
+        self.num_steps = steps * 2  # cond + uncond
+        self.accumulated_dist_even = 0.0
+        self.accumulated_dist_odd = 0.0
         self.prev_emb_even = None
         self.prev_emb_odd = None
         self.prev_res_even = None
@@ -44,24 +58,20 @@ class TeaCacheContext:
         self.skipped_steps = 0
         self.total_evals = 0
 
-    def should_compute(self, time_emb, is_even):
-        """
-        Determines whether to compute the DiT residual or reuse cached residual.
-        """
+    def should_compute(self, time_emb, is_even: bool) -> bool:
         self.total_evals += 1
         
-        # Always compute during retention steps (beginning/end of denoising)
+        # Always compute during retention steps (beginning/end of sampling)
         if self.cnt < self.ret_steps or self.cnt >= (self.num_steps - self.ret_steps):
             if is_even:
-                self.accumulated_distance_even = 0.0
+                self.accumulated_dist_even = 0.0
                 self.prev_emb_even = time_emb
             else:
-                self.accumulated_distance_odd = 0.0
+                self.accumulated_dist_odd = 0.0
                 self.prev_emb_odd = time_emb
             return True
 
         prev_emb = self.prev_emb_even if is_even else self.prev_emb_odd
-        
         if prev_emb is None:
             if is_even:
                 self.prev_emb_even = time_emb
@@ -69,147 +79,147 @@ class TeaCacheContext:
                 self.prev_emb_odd = time_emb
             return True
 
-        # Compute relative L1 distance in MLX
+        # Calculate relative L1 distance
         diff = mx.mean(mx.abs(time_emb - prev_emb))
         norm = mx.mean(mx.abs(prev_emb)) + 1e-8
         rel_l1 = (diff / norm).item()
-        
-        scaled_dist = float(self.rescale_func(rel_l1))
-        
+        scaled_dist = float(self.poly_rescale(rel_l1))
+
         if is_even:
-            self.accumulated_distance_even += scaled_dist
-            if self.accumulated_distance_even < self.threshold:
+            self.accumulated_dist_even += scaled_dist
+            if self.accumulated_dist_even < self.threshold:
                 self.skipped_steps += 1
                 return False
-            self.accumulated_distance_even = 0.0
+            self.accumulated_dist_even = 0.0
             self.prev_emb_even = time_emb
         else:
-            self.accumulated_distance_odd += scaled_dist
-            if self.accumulated_distance_odd < self.threshold:
+            self.accumulated_dist_odd += scaled_dist
+            if self.accumulated_dist_odd < self.threshold:
                 self.skipped_steps += 1
                 return False
-            self.accumulated_distance_odd = 0.0
+            self.accumulated_dist_odd = 0.0
             self.prev_emb_odd = time_emb
-            
+
         return True
 
 
-class DummyTransformerMLX(nn.Module):
-    """
-    Mock Transformer wrapper representing the loaded 4-bit safetensors weights.
-    Applies the TeaCache logic inside the forward pass.
-    """
-    def __init__(self, weights_path):
-        super().__init__()
-        self.weights_path = weights_path
-        self.teacache = None
+def apply_teacache_to_model(model, teacache_thresh: float, steps: int):
+    """Hooks TeaCache context into the DiT Transformer forward pass."""
+    tc = TeaCacheContext(threshold=teacache_thresh)
+    tc.reset(steps)
+    model.teacache = tc
+    
+    orig_forward = model.__call__ if hasattr(model, "__call__") else getattr(model, "forward", None)
+
+    def teacache_forward(self, x, t, context=None, **kwargs):
+        if not hasattr(self, "teacache") or self.teacache is None:
+            return orig_forward(x, t, context=context, **kwargs)
+
+        tc = self.teacache
+        is_even = (tc.cnt % 2 == 0)
         
-    def __call__(self, x, timestep, context=None):
-        # Time embedding computation
-        time_emb = mx.sin(timestep * 0.01) + 0.1
-        
-        if self.teacache is not None:
-            is_even = (self.teacache.cnt % 2 == 0)
-            compute = self.teacache.should_compute(time_emb, is_even)
-            self.teacache.cnt += 1
-            
-            if not compute:
-                # Reuse residual from previous evaluation
-                cached_res = self.teacache.prev_res_even if is_even else self.teacache.prev_res_odd
-                return x + cached_res
-            
-            # Execute standard layer evaluations
-            residual = x * 0.05 + 0.01  # Simulated block pass
-            if is_even:
-                self.teacache.prev_res_even = residual
-            else:
-                self.teacache.prev_res_odd = residual
-                
-            return x + residual
+        # Calculate time condition vector
+        time_emb = t if isinstance(t, mx.array) else mx.array([t])
+        compute = tc.should_compute(time_emb, is_even)
+        tc.cnt += 1
+
+        if not compute:
+            cached_res = tc.prev_res_even if is_even else tc.prev_res_odd
+            if cached_res is not None:
+                return cached_res
+
+        out = orig_forward(x, t, context=context, **kwargs)
+        if is_even:
+            tc.prev_res_even = out
         else:
-            return x * 1.05
-
-
-class PipelineMLX:
-    def __init__(self):
-        self.model = None
-
-    def load_model(self, model_path):
-        if self.model is None or getattr(self.model, "weights_path", None) != model_path:
-            print(f"[MLX] Loading 4-bit Transformer from: {model_path}")
-            self.model = DummyTransformerMLX(model_path)
-            # Synchronize MLX compute stream
-            mx.eval()
-
-    def s2v(
-        self,
-        prompt: str,
-        reference_images: list,
-        output_path: str = "out.mp4",
-        size: tuple = (512, 256),
-        frame_num: int = 81,
-        steps: int = 30,
-        teacache_thresh: float = 0.15,
-        phantom_pth: str = "",
-    ):
-        start_time = time.time()
-        
-        # 1. Load Model Weights
-        self.load_model(phantom_pth)
-        
-        # 2. Setup TeaCache
-        teacache = TeaCacheContext(threshold=teacache_thresh)
-        teacache.reset(total_steps=steps)
-        self.model.teacache = teacache
-        
-        print(f"[MLX] Prompt: '{prompt}'")
-        print(f"[MLX] Processing {len(reference_images)} reference images at {size[0]}x{size[1]}")
-        
-        # 3. Latent Initialization (MLX arrays)
-        # Latent dimensions: (B, C, F, H, W)
-        lat_h, lat_w = size[1] // 8, size[0] // 8
-        latents = mx.random.normal((1, 16, (frame_num - 1) // 4 + 1, lat_h, lat_w))
-        
-        # Timestep schedule
-        timesteps = np.linspace(1000, 0, steps)
-        
-        # 4. Denoising Loop
-        print(f"[MLX] Beginning sampling loop ({steps} steps) with TeaCache (threshold={teacache_thresh})...")
-        for t in tqdm(timesteps, desc="Sampling Frames"):
-            t_array = mx.array([t])
+            tc.prev_res_odd = out
             
-            # Conditional evaluation
-            latents = self.model(latents, t_array, context=prompt)
-            # Unconditional evaluation (CFG)
-            latents = self.model(latents, t_array, context="")
-            
-            # Evaluate stream state periodically to free memory pressure
-            mx.eval(latents)
+        return out
 
-        elapsed = time.time() - start_time
-        
-        # 5. Output Render Simulation
-        print(f"[MLX] Decoding latents into video ({frame_num} frames)...")
-        # Ensure target directory exists
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        with open(output_path, "wb") as f:
-            f.write(b"OK")  # Mock output video file write
+    model.__call__ = types.MethodType(teacache_forward, model)
+    return tc
 
-        # 6. Performance Summary
-        skipped = teacache.skipped_steps
-        total = teacache.total_evals
+
+def encode_prompt(prompt: str, phantom_pth=None):
+    """Offline umT5 encode → [L, 4096] context. For the Swift escape hatch: encode prompts
+    in Python, save the embeddings, pass them to a Swift consumer via precomputed_context
+    (bypasses the ftfy cleaner + SentencePiece tokenizer + 11 GB umT5 at Swift runtime)."""
+    _, cfg = W.load_phantom_dit(phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth")
+    t5, tok = W.load_umt5(cfg)
+    return W.encode_text(t5, tok, prompt, cfg.text_len)
+
+
+def _save_video(frames_bchw, path, fps=16):
+    import imageio
+    # frames_bchw: mx [1,3,T,H,W] in [-1,1] -> uint8 list
+    v = ((np.array(frames_bchw[0]).transpose(1, 2, 3, 0) + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+    imageio.mimsave(path, list(v), fps=fps, quality=8)
+    return path
+
+
+def s2v(prompt: str, reference_images: list, output_path: str,
+        size=(832, 480), frame_num: int = 81, steps: int = 50, shift: float = 5.0,
+        guide_img: float = 5.0, guide_text: float = 7.5, seed: int = 0,
+        phantom_pth=None, vae_pth=None, lossless_decode: bool = True,
+        precomputed_context=None, precomputed_context_null=None, verbose: bool = True,
+        teacache_thresh: float = 0.0):
+    """Generate a subject-consistent video from a prompt + reference images."""
+    w_px, h_px = size
+    phantom_pth = phantom_pth or ROOT / "weights/phantom/Phantom-Wan-1.3B.pth"
+    vae_pth = vae_pth or ROOT / "weights/wan-base/Wan2.1_VAE.pth"
+
+    cfg_run = PhantomWanConfig.s2v_1_3b()
+    model, cfg = W.load_phantom_dit(phantom_pth)               # cfg = mlx-video WanModelConfig
+
+    # Enable TeaCache dynamically if threshold > 0
+    tc_context = None
+    if teacache_thresh > 0.0:
+        if verbose:
+            print(f"[TeaCache] Enabling feature caching with threshold={teacache_thresh}", flush=True)
+        tc_context = apply_teacache_to_model(model, teacache_thresh, steps)
+
+    # text — escape hatch: precomputed [L,4096] umT5 context bypasses cleaning+tokenizer+umT5
+    # entirely (Swift-port safety net: encode prompts in Python, ship the embeddings). See
+    # encode_prompt() + docs/development/swift-port-concerns.md.
+    if precomputed_context is not None:
+        ctx = precomputed_context
+        ctx_null = precomputed_context_null if precomputed_context_null is not None else precomputed_context
+    else:
+        t5, tok = W.load_umt5(cfg)
+        ctx = W.encode_text(t5, tok, prompt, cfg.text_len)
+        ctx_null = W.encode_text(t5, tok, NEG_PROMPT, cfg.text_len)
+        del t5
+
+    # reference latents (encoder VAE)
+    enc = W.load_wan_vae(vae_pth, encoder=True)
+    refs = [Image.open(p) for p in reference_images]
+    ref_lat = encode_references(enc, refs, w_px, h_px)
+    del enc
+
+    # target latent grid
+    f_latent = (frame_num - 1) // cfg_run.vae_stride[0] + 1     # temporal stride 4
+    h_lat, w_lat = h_px // cfg_run.vae_stride[1], w_px // cfg_run.vae_stride[2]
+    if verbose:
+        print(f"f_latent={f_latent} (={frame_num} frames) grid {h_lat}x{w_lat}, K={ref_lat.shape[2]} refs", flush=True)
+
+    x0 = sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent, h_lat, w_lat,
+                    steps=steps, shift=shift, guide_img=guide_img, guide_text=guide_text,
+                    seed=seed, verbose=verbose)
+    
+    if tc_context is not None and verbose:
+        skipped = tc_context.skipped_steps
+        total = tc_context.total_evals
         speedup = total / (total - skipped) if (total - skipped) > 0 else 1.0
-        
-        print("\n" + "="*50)
-        print("          TEA-CACHE PERFORMANCE SUMMARY          ")
-        print("="*50)
-        print(f"Total Model Calls (Cond + Uncond) : {total}")
-        print(f"Skipped Model Computations        : {skipped} ({skipped / total * 100:.1f}%)")
-        print(f"Effective Acceleration Factor     : {speedup:.2f}x Speedup")
-        print(f"Total Execution Time              : {elapsed:.2f}s")
-        print(f"Output Saved To                   : {output_path}")
-        print("="*50 + "\n")
+        print(f"[TeaCache] Skipped {skipped}/{total} step evaluations (~{speedup:.2f}x speedup)", flush=True)
 
+    del model
 
-# Global Singleton Pipeline instance
-pipeline_mlx = PipelineMLX()
+    # decode — streaming (lossless, flat memory) unblocks long video; whole-seq OOMs >~49 frames
+    dec = W.load_wan_vae(vae_pth, encoder=False)
+    if lossless_decode:
+        from .streaming_decode import decode_streaming
+        video = decode_streaming(dec, x0[None], chunk_lat=1)
+    else:
+        video = dec.decode(x0[None])
+    mx.eval(video)
+    return _save_video(video, output_path, fps=cfg_run.sample_fps)
