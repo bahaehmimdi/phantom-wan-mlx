@@ -1,16 +1,3 @@
-from __future__ import annotations
-
-import mlx.core as mx
-
-
-def prepare_grid(model, f_latent: int, h_latent: int, w_latent: int, patch_size: tuple[int, int, int]):
-    """Prepare grid dimensions and RoPE sequence info."""
-    p_t, p_h, p_w = patch_size if isinstance(patch_size, (list, tuple)) else (1, patch_size, patch_size)
-    seq_len = (f_latent // p_t) * (h_latent // p_h) * (w_latent // p_w)
-    rope = getattr(model, "freqs", None)
-    return rope, seq_len
-
-
 def forward(
     model,
     x: mx.array,                   # [16, F, H, W]
@@ -43,8 +30,17 @@ def forward(
         ctx_in = ctx_in[None]
 
     # 4. Project umT5 context (4096 -> 1536) before cross attention
-    if ctx_in.shape[-1] == 4096 and hasattr(model, "text_embedding"):
-        ctx_in = model.text_embedding(ctx_in)
+    if ctx_in.shape[-1] == 4096:
+        if hasattr(model, "text_embedding"):
+            ctx_in = model.text_embedding(ctx_in)
+        elif hasattr(model, "context_embedding"):
+            ctx_in = model.context_embedding(ctx_in)
+        elif hasattr(model, "text_proj"):
+            ctx_in = model.text_proj(ctx_in)
+        else:
+            # If the layer name is entirely different, print what we have and crash loudly
+            attrs = [k for k in dir(model) if not k.startswith('_')]
+            raise AttributeError(f"Could not find the 4096->1536 text projection layer on model. Available attributes: {attrs}")
 
     # 5. TeaCache evaluation
     if teacache is not None and hasattr(teacache, "should_skip"):
