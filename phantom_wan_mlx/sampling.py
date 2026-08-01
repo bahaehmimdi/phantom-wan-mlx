@@ -11,8 +11,7 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
     """Sample S2V latent using Flow Matching with dual CFG and TeaCache support."""
     mx.random.seed(seed)
     
-    # Latent noise initialization: [1, in_dim, f_latent, h_lat, w_lat] or [in_dim, f_latent, h_lat, w_lat]
-    # Match the shape expected by model forward
+    # Latent noise initialization: [1, in_dim, f_latent, h_lat, w_lat]
     z = mx.random.normal((1, cfg.in_dim, f_latent, h_lat, w_lat), dtype=mx.bfloat16)
     
     # Generate schedule
@@ -33,8 +32,8 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
         t_next = shifted_timesteps[i + 1]
         dt = t_next - t_curr
 
-        # Convert float timestep to array for MLX model call
-        t_arr = mx.array([t_curr * 1000.0], dtype=mx.float32)
+        # FIX: mlx_video WanModel expects t as a scalar (float), NOT an mx.array!
+        t_val = float(t_curr * 1000.0)
 
         should_calc = True
 
@@ -51,21 +50,21 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
             accumulated_l1 = 0.0
 
             # --- Forward Pass Calls ---
-            # 1. Joint Subject + Text Pass (pass ref_lat as secondary positional or ref arg)
+            # 1. Joint Subject + Text Pass
             if ref_lat is not None:
-                v_cond = model(z, t_arr, ctx, ref_lat)
+                v_cond = model(z, t_val, ctx, ref_lat)
             else:
-                v_cond = model(z, t_arr, ctx)
+                v_cond = model(z, t_val, ctx)
             
             # 2. Text-only Guidance Pass
             if guide_img != 1.0 and ref_lat is not None:
-                v_text = model(z, t_arr, ctx)
+                v_text = model(z, t_val, ctx)
             else:
                 v_text = v_cond
                 
             # 3. Unconditional Guidance Pass
             if guide_text != 1.0:
-                v_uncond = model(z, t_arr, ctx_null)
+                v_uncond = model(z, t_val, ctx_null)
             else:
                 v_uncond = v_text
 
@@ -88,7 +87,7 @@ def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_
         speedup = total_steps / max(1, total_steps - skipped_steps)
         print(f"[TeaCache MLX] Skipped {skipped_steps}/{total_steps} steps (~{speedup:.2f}x speedup)")
 
-    # Squeeze batch dim if needed by VAE decode
+    # Ensure shape consistency for VAE decoding
     if z.ndim == 5 and z.shape[0] == 1:
         z = z[0]
 
