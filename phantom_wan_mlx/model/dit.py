@@ -32,24 +32,25 @@ def forward(
     teacache=None,
     teacache_mode: str = "default",
 ):
-    """DiT forward wrapper handling layout transpose and text projection."""
+    """DiT forward wrapper fixing patchify channel alignment [1, 16, F, H, W]."""
     
-    # 1. Transpose latents to match [B, F, C, H, W] expected by mlx_video
+    # 1. Format input tensor x strictly to 5D [1, 16, F, H, W]
     if x.ndim == 4:
-        x_in = mx.transpose(x, (1, 0, 2, 3))[None]
-    elif x.ndim == 5 and x.shape[1] == 16:
+        # x is [16, F, H, W] -> add batch dimension [1, 16, F, H, W]
+        x_in = x[None]
+    elif x.ndim == 5 and x.shape[2] == 16:
+        # If shape is [1, F, 16, H, W], transpose back to [1, 16, F, H, W]
         x_in = mx.transpose(x, (0, 2, 1, 3, 4))
     else:
         x_in = x
 
-    # 2. Check and project text context if model exposes text_embedder
+    # 2. Text projection / text embedder check
     ctx_in = context
     if hasattr(model, "text_embedder") and context.shape[-1] == 4096:
         ctx_in = model.text_embedder(context)
     elif hasattr(model, "text_embedding") and context.shape[-1] == 4096:
         ctx_in = model.text_embedding(context)
 
-    # 3. Ensure context has batch dimension if needed [1, seq_len, dim]
     if ctx_in.ndim == 2:
         ctx_in = ctx_in[None]
 
@@ -60,15 +61,16 @@ def forward(
         if should_skip:
             return cached_output
 
-    # 4. Forward pass
-    if seq_len is not None:
+    # 3. Model call using grid arguments if accepted by mlx_video Wan2.1
+    # Check if model accepts seq_len or rope
+    try:
         out = model(x_in, t=t, context=ctx_in, seq_len=seq_len)
-    else:
+    except TypeError:
         out = model(x_in, t=t, context=ctx_in)
 
-    # 5. Transpose output back to sampler layout [16, F, H, W]
+    # 4. Squeeze batch dimension to return [16, F, H, W] back to sample_s2v
     if out.ndim == 5:
-        out_ret = mx.transpose(out.squeeze(0), (1, 0, 2, 3))
+        out_ret = out.squeeze(0)
     else:
         out_ret = out
 
