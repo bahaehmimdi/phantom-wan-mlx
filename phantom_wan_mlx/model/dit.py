@@ -22,12 +22,26 @@ def prepare_grid(model, t_latent: int, h_latent: int, w_latent: int, patch_size,
     return rope_cos_sin, seq_len
 
 
-def forward(model, latent_cfhw, t, context, rope_cos_sin, seq_len, cross_kv_caches=None):
-    """One DiT forward over an assembled [C, F+K, H, W] latent (list-as-batch).
+import mlx.core as mx
 
-    latent_cfhw: list of [C, F+K, H, W] (one per batch element), OR a single [C,F+K,H,W].
-    Returns list of [C, F+K, H, W] predicted velocities.
+def forward(model, inp, t, ctx, rope_cos_sin, seq_len, cross_kv_caches=None):
     """
-    x_list = latent_cfhw if isinstance(latent_cfhw, list) else [latent_cfhw]
-    ctx = context if isinstance(context, list) else [context]
-    return model(x_list, t, ctx, seq_len, cross_kv_caches=cross_kv_caches, rope_cos_sin=rope_cos_sin)
+    Standardizes input format before feeding into MLX Wan2.1.
+    """
+    # If inp was passed as a single tensor, split/wrap it as a list expected by Wan2.1
+    if isinstance(inp, mx.array):
+        x_list = [inp]
+    elif isinstance(inp, (list, tuple)):
+        x_list = list(inp)
+    else:
+        x_list = [inp]
+
+    # Ensure t and ctx are in expected list/batch containers if necessary
+    return model(
+        x_list, 
+        t, 
+        ctx, 
+        seq_len=seq_len, 
+        cross_kv_caches=cross_kv_caches, 
+        rope_cos_sin=rope_cos_sin
+    )
