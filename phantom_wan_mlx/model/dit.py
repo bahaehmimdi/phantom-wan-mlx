@@ -32,8 +32,7 @@ def forward(
     teacache=None,
     teacache_mode: str = "default",
 ):
-    """DiT forward wrapper matching WanModel interface."""
-    
+    """DiT forward wrapper compatible with WanModel and TeaCache."""
     if teacache is not None:
         should_skip, cached_output = teacache.should_skip(
             model=model, x=x, t=t, context=context, mode=teacache_mode
@@ -41,9 +40,12 @@ def forward(
         if should_skip:
             return cached_output
 
-    # Drop 'rope' keyword argument when invoking model()
-    # Pass seq_len or grid context as supported by WanModel
-    out = model(x, t=t, context=context, seq_len=seq_len)
+    # Drop 'rope' from the direct model call as WanModel computes/uses it internally
+    # Pass seq_len if required by WanModel.__call__, otherwise pass x, t, context
+    if seq_len is not None:
+        out = model(x, t=t, context=context, seq_len=seq_len)
+    else:
+        out = model(x, t=t, context=context)
 
     if teacache is not None:
         teacache.update_cache(out, mode=teacache_mode)
