@@ -24,24 +24,27 @@ def prepare_grid(model, t_latent: int, h_latent: int, w_latent: int, patch_size,
 
 import mlx.core as mx
 
+
 def forward(model, inp, t, ctx, rope_cos_sin, seq_len, cross_kv_caches=None):
     """
     Standardizes input format before feeding into MLX Wan2.1.
     """
-    # If inp was passed as a single tensor, split/wrap it as a list expected by Wan2.1
+    # mlx_video's Wan2.1 __call__ expects x to be a list/tuple of 4D latents: [ (C, F, H, W) ]
     if isinstance(inp, mx.array):
-        x_list = [inp]
+        if inp.ndim == 5 and inp.shape[0] == 1:
+            inp = inp.squeeze(0) # ensure 4D: (16, F+K, H, W)
+        x_in = [inp]
     elif isinstance(inp, (list, tuple)):
-        x_list = list(inp)
+        x_in = [x.squeeze(0) if (isinstance(x, mx.array) and x.ndim == 5) else x for x in inp]
     else:
-        x_list = [inp]
+        x_in = [inp]
 
-    # Ensure t and ctx are in expected list/batch containers if necessary
+    # Call mlx_video model with x_in list
     return model(
-        x_list, 
-        t, 
-        ctx, 
-        seq_len=seq_len, 
-        cross_kv_caches=cross_kv_caches, 
+        x_in,
+        t,
+        ctx,
+        seq_len=seq_len,
+        cross_kv_caches=cross_kv_caches,
         rope_cos_sin=rope_cos_sin
     )
