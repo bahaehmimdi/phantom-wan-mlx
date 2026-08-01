@@ -1,0 +1,59 @@
+import mlx.core as mx
+
+class TeaCache:
+    # ADDED **kwargs to safely absorb num_inference_steps or any other extra arguments
+    def __init__(self, threshold: float = 0.0, **kwargs):
+        """
+        Timestep Embedding Aware Cache (TeaCache).
+        Skips transformer block computation if the input hasn't changed much.
+        """
+        self.threshold = threshold
+        self.config = kwargs  # Store extra arguments just in case
+        
+        # Dictionary to isolate caches for different CFG branches (pos_it, pos_i, neg)
+        self.states = {}
+
+    def should_skip(self, model, x: mx.array, t: mx.array, context: mx.array, mode: str = "default"):
+        """
+        Calculates the relative L1 distance between current and previous input.
+        Returns: (should_skip: bool, cached_output: mx.array or None)
+        """
+        if self.threshold <= 0.0:
+            return False, None
+
+        if mode not in self.states:
+            # First time seeing this CFG branch, initialize its memory
+            self.states[mode] = {"prev_x": x, "prev_out": None}
+            return False, None
+
+        state = self.states[mode]
+        prev_x = state["prev_x"]
+
+        # Calculate relative L1 distance: mean(|x - prev_x|) / mean(|prev_x|)
+        diff = mx.abs(x - prev_x).mean()
+        norm = mx.abs(prev_x).mean()
+        
+        # Pull to CPU context to evaluate the boolean condition
+        norm_val = norm.item()
+        if norm_val == 0.0:
+            rel_dist = diff.item()
+        else:
+            rel_dist = (diff / norm).item()
+
+        # If the input shifted less than the threshold, skip the heavy DiT blocks!
+        if rel_dist < self.threshold and state["prev_out"] is not None:
+            return True, state["prev_out"]
+
+        # Otherwise, update the tracked input and compute normally
+        state["prev_x"] = x
+        return False, None
+
+    def update_cache(self, output: mx.array, mode: str = "default"):
+        """
+        Stores the output of the DiT to be used in future skipped steps.
+        """
+        if self.threshold <= 0.0:
+            return
+            
+        if mode in self.states:
+            self.states[mode]["prev_out"] = output
