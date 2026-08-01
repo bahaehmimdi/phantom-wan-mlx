@@ -1,4 +1,4 @@
-"""Dual-scale chained CFG sampler for S2V (G1) with TeaCache support.
+"""Dual-scale chained CFG sampler for S2V (G1).
 
 Per step, THREE DiT forwards (locked vs subject2video.generate:286-313):
   pos_it = model(cat[noisy_target, refs],      context=text)
@@ -31,7 +31,6 @@ def sample_s2v(
     guide_text: float = 7.5,
     seed: int = 0,
     verbose: bool = False,
-    teacache=None,
 ):
     from mlx_video.models.wan_2.scheduler import FlowUniPCScheduler
 
@@ -53,34 +52,14 @@ def sample_s2v(
         inp_refs = mx.concatenate([noisy_target, refs], axis=1)         # re-clamp clean refs
         inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)
 
-        # Forward 1: Text + Image condition (pos_it)
-        pos_it = DIT.forward(
-            model, inp_refs, t_arr, context, rope, seq_len,
-            teacache=teacache, teacache_mode="pos_it"
-        )[0]
+        pos_it = DIT.forward(model, inp_refs, t_arr, context, rope, seq_len)[0]
+        pos_i = DIT.forward(model, inp_refs, t_arr, context_null, rope, seq_len)[0]
+        neg = DIT.forward(model, inp_zero, t_arr, context_null, rope, seq_len)[0]
 
-        # Forward 2: Image-only condition (pos_i)
-        pos_i = DIT.forward(
-            model, inp_refs, t_arr, context_null, rope, seq_len,
-            teacache=teacache, teacache_mode="pos_i"
-        )[0]
-
-        # Forward 3: Zero-ref / Unconditional (neg)
-        neg = DIT.forward(
-            model, inp_zero, t_arr, context_null, rope, seq_len,
-            teacache=teacache, teacache_mode="neg"
-        )[0]
-
-        # Standard dual-scale CFG equation
         noise_pred = neg + guide_img * (pos_i - neg) + guide_text * (pos_it - pos_i)
         latent = sched.step(noise_pred[None], t, latent[None]).squeeze(0)
-
-        # Advance TeaCache step counter once per completed diffusion iteration
-        if teacache is not None and hasattr(teacache, "next_step"):
-            teacache.next_step()
-
         mx.eval(latent)                                                 # Metal cmd-buffer boundary
         if verbose:
             print(f"  step {i + 1}/{steps}", flush=True)
 
-    return latent[:, :-k]                                               # strip ref tail -> [16, F, h, w] update
+    return latent[:, :-k]                                               # strip ref tail -> [16, F, h, w]
