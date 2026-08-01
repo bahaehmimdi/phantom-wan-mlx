@@ -1,14 +1,4 @@
-"""Dual-scale chained CFG sampler for S2V (G1).
-
-Per step, THREE DiT forwards (locked vs subject2video.generate:286-313):
-  pos_it = model(cat[noisy_target, refs],      context=text)
-  pos_i  = model(cat[noisy_target, refs],      context=null)
-  neg    = model(cat[noisy_target, ZERO refs], context=null)
-  noise_pred = neg + w_img*(pos_i - neg) + w_text*(pos_it - pos_i)
-Defaults w_img=5.0, w_text=7.5. Subject-"uncond" = ZEROED ref latent (not dropout).
-Per step the model input re-clamps the ref tail to CLEAN refs; after the loop the K ref
-frames are stripped. Scheduler: mlx-video FlowUniPCScheduler, shift 5.0, 50 steps.
-"""
+"""Dual-scale chained CFG sampler for S2V (G1) with TeaCache support."""
 from __future__ import annotations
 
 import mlx.core as mx
@@ -31,6 +21,7 @@ def sample_s2v(
     guide_text: float = 7.5,
     seed: int = 0,
     verbose: bool = False,
+    teacache=None,
 ):
     from mlx_video.models.wan_2.scheduler import FlowUniPCScheduler
 
@@ -49,15 +40,34 @@ def sample_s2v(
     for i, t in enumerate(sched.timesteps):
         t_arr = mx.array([t])
         noisy_target = latent[:, :-k]                                   # [16, F, h, w]
-        inp_refs = mx.concatenate([noisy_target, refs], axis=1)         # re-clamp clean refs
+        inp_refs = mx.concatenate([noisy_target, refs], axis=1)         # re-clamp clean refs -> [16, F+K, h, w]
         inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)
 
-        pos_it = DIT.forward(model, inp_refs, t_arr, context, rope, seq_len)[0]
-        pos_i = DIT.forward(model, inp_refs, t_arr, context_null, rope, seq_len)[0]
-        neg = DIT.forward(model, inp_zero, t_arr, context_null, rope, seq_len)[0]
+        # Forward 1: Text + Image condition (pos_it)
+        pos_it = DIT.forward(
+            model, inp_refs, t_arr, context, rope, seq_len,
+            teacache=teacache, teacache_mode="pos_it"
+        )
 
+        # Forward 2: Image-only condition (pos_i)
+        pos_i = DIT.forward(
+            model, inp_refs, t_arr, context_null, rope, seq_len,
+            teacache=teacache, teacache_mode="pos_i"
+        )
+
+        # Forward 3: Zero-ref / Unconditional (neg)
+        neg = DIT.forward(
+            model, inp_zero, t_arr, context_null, rope, seq_len,
+            teacache=teacache, teacache_mode="neg"
+        )
+
+        # Dual-scale CFG
         noise_pred = neg + guide_img * (pos_i - neg) + guide_text * (pos_it - pos_i)
         latent = sched.step(noise_pred[None], t, latent[None]).squeeze(0)
+
+        if teacache is not None and hasattr(teacache, "next_step"):
+            teacache.next_step()
+
         mx.eval(latent)                                                 # Metal cmd-buffer boundary
         if verbose:
             print(f"  step {i + 1}/{steps}", flush=True)
