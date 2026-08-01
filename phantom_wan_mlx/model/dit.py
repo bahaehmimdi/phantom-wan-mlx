@@ -22,12 +22,61 @@ def prepare_grid(model, t_latent: int, h_latent: int, w_latent: int, patch_size,
     return rope_cos_sin, seq_len
 
 
-def forward(model, latent_cfhw, t, context, rope_cos_sin, seq_len, cross_kv_caches=None):
-    """One DiT forward over an assembled [C, F+K, H, W] latent (list-as-batch).
+def forward(
+    model,
+    x: mx.array,                   # [16, F, H, W]
+    t: mx.array,                   # [1] or scalar
+    context: mx.array,             # [seq, 4096] or [1, seq, 4096]
+    rope=None,
+    seq_len: int = None,
+    teacache=None,
+    teacache_mode: str = "default",
+):
+    """DiT forward wrapper matching mlx_video WanModel.__call__(x, t, context, seq_len)."""
+    
+    # 1. Format input tensor layout: [16, F, H, W] -> [1, 16, F, H, W]
+    if x.ndim == 4:
+        x_in = x[None]
+    elif x.ndim == 5 and x.shape[1] != 16 and x.shape[2] == 16:
+        x_in = mx.transpose(x, (0, 2, 1, 3, 4))
+    else:
+        x_in = x
 
-    latent_cfhw: list of [C, F+K, H, W] (one per batch element), OR a single [C,F+K,H,W].
-    Returns list of [C, F+K, H, W] predicted velocities.
-    """
-    x_list = latent_cfhw if isinstance(latent_cfhw, list) else [latent_cfhw]
-    ctx = context if isinstance(context, list) else [context]
-    return model(x_list, t, ctx, seq_len, cross_kv_caches=cross_kv_caches, rope_cos_sin=rope_cos_sin)
+    # 2. Derive seq_len if not explicitly passed
+    if seq_len is None:
+        p_t, p_h, p_w = getattr(model.config, "patch_size", (1, 2, 2))
+        _, _, F, H, W = x_in.shape
+        seq_len = (F // p_t) * (H // p_h) * (W // p_w)
+
+    # 3. Ensure context has batch dimension [1, seq_len, 4096]
+    ctx_in = context
+    if ctx_in.ndim == 2:
+        ctx_in = ctx_in[None]
+
+    # 4. Project umT5 context (4096 -> 1536) before cross attention
+    if ctx_in.shape[-1] == 4096 and hasattr(model, "embed_text"):
+        ctx_in = model.embed_text(ctx_in)
+
+    # 5. TeaCache evaluation
+    if teacache is not None and hasattr(teacache, "should_skip"):
+        should_skip, cached_output = teacache.should_skip(
+            model=model, x=x_in, t=t, context=ctx_in, mode=teacache_mode
+        )
+        if should_skip:
+            return cached_output
+
+    # 6. Forward call to WanModel with projected context (1536-dim)
+    out = model(x_in, t=t, context=ctx_in, seq_len=seq_len)
+
+    # NEW: Extract the tensor if mlx_video returns a list or tuple
+    if isinstance(out, (list, tuple)):
+        out = out[0]
+
+    # 7. Return [16, F, H, W] tensor back to sampler
+    out_ret = out.squeeze(0) if out.ndim == 5 else out
+
+    # 8. Update TeaCache state
+    if teacache is not None and hasattr(teacache, "update_cache"):
+        teacache.update_cache(out_ret, mode=teacache_mode)
+
+    return out_ret
