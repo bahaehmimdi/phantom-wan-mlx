@@ -1,95 +1,65 @@
-"""Sampling utilities for Phantom-Wan S2V (MLX)."""
+"""Dual-scale chained CFG sampler for S2V (G1).
+
+Per step, THREE DiT forwards (locked vs subject2video.generate:286-313):
+  pos_it = model(cat[noisy_target, refs],      context=text)
+  pos_i  = model(cat[noisy_target, refs],      context=null)
+  neg    = model(cat[noisy_target, ZERO refs], context=null)
+  noise_pred = neg + w_img*(pos_i - neg) + w_text*(pos_it - pos_i)
+Defaults w_img=5.0, w_text=7.5. Subject-"uncond" = ZEROED ref latent (not dropout).
+Per step the model input re-clamps the ref tail to CLEAN refs; after the loop the K ref
+frames are stripped. Scheduler: mlx-video FlowUniPCScheduler, shift 5.0, 50 steps.
+"""
 from __future__ import annotations
 
-import math
 import mlx.core as mx
 
+from .model import dit as DIT
 
-def sample_s2v(model, ref_lat, ctx, ctx_null, cfg, f_latent: int, h_lat: int, w_lat: int,
-               steps: int = 50, shift: float = 5.0, guide_img: float = 5.0, guide_text: float = 7.5,
-               seed: int = 0, verbose: bool = True, teacache_thresh: float = 0.0):
-    """Sample S2V latent using Flow Matching with dual CFG and TeaCache support."""
+
+def sample_s2v(
+    model,
+    ref_latents: mx.array,        # [1, 16, K, h, w] clean reference latents
+    context: mx.array,            # text embedding [seq, 4096]
+    context_null: mx.array,       # null/neg-prompt embedding [seq, 4096]
+    cfg,                          # PhantomWanConfig / WanModelConfig (patch_size)
+    f_latent: int,                # F target latent frames
+    h_latent: int,
+    w_latent: int,
+    steps: int = 50,
+    shift: float = 5.0,
+    guide_img: float = 5.0,
+    guide_text: float = 7.5,
+    seed: int = 0,
+    verbose: bool = False,
+):
+    from mlx_video.models.wan_2.scheduler import FlowUniPCScheduler
+
+    refs = ref_latents[0]                       # [16, K, h, w]
+    k = refs.shape[1]
+    refs_neg = mx.zeros_like(refs)
+    patch = cfg.patch_size
+
+    rope, seq_len = DIT.prepare_grid(model, f_latent + k, h_latent, w_latent, patch)
+    sched = FlowUniPCScheduler(num_train_timesteps=getattr(cfg, "num_train_timesteps", 1000))
+    sched.set_timesteps(steps, shift=shift)
+
     mx.random.seed(seed)
-    
-    # Latent noise initialization: [1, in_dim, f_latent, h_lat, w_lat]
-    z = mx.random.normal((1, cfg.in_dim, f_latent, h_lat, w_lat), dtype=mx.bfloat16)
-    
-    # Generate schedule
-    timesteps = [1.0 - i / steps for i in range(steps)]
-    shifted_timesteps = [(shift * t) / (1.0 + (shift - 1.0) * t) if t > 0 else 0.0 for t in timesteps]
-    
-    # TeaCache tracking state
-    accumulated_l1 = 0.0
-    prev_input = None
-    cached_residual = None
-    skipped_steps = 0
+    latent = mx.random.normal((16, f_latent + k, h_latent, w_latent))   # [16, F+K, h, w]
 
-    if verbose and teacache_thresh > 0.0:
-        print(f"[TeaCache MLX] Enabled with threshold: {teacache_thresh}")
+    for i, t in enumerate(sched.timesteps):
+        t_arr = mx.array([t])
+        noisy_target = latent[:, :-k]                                   # [16, F, h, w]
+        inp_refs = mx.concatenate([noisy_target, refs], axis=1)         # re-clamp clean refs
+        inp_zero = mx.concatenate([noisy_target, refs_neg], axis=1)
 
-    for i in range(len(shifted_timesteps) - 1):
-        t_curr = shifted_timesteps[i]
-        t_next = shifted_timesteps[i + 1]
-        dt = t_next - t_curr
+        pos_it = DIT.forward(model, inp_refs, t_arr, context, rope, seq_len)[0]
+        pos_i = DIT.forward(model, inp_refs, t_arr, context_null, rope, seq_len)[0]
+        neg = DIT.forward(model, inp_zero, t_arr, context_null, rope, seq_len)[0]
 
-        # FIX: mlx_video WanModel requires t as an 1D MLX array of shape (1,)
-        # Note: If your weights expect 0..1000 range, use t_curr * 1000.0
-        t_arr = mx.array([t_curr], dtype=mx.float32)
+        noise_pred = neg + guide_img * (pos_i - neg) + guide_text * (pos_it - pos_i)
+        latent = sched.step(noise_pred[None], t, latent[None]).squeeze(0)
+        mx.eval(latent)                                                 # Metal cmd-buffer boundary
+        if verbose:
+            print(f"  step {i + 1}/{steps}", flush=True)
 
-        should_calc = True
-
-        # Check TeaCache L1 threshold
-        if teacache_thresh > 0.0 and prev_input is not None:
-            l1_diff = mx.mean(mx.abs(z - prev_input)) / (mx.mean(mx.abs(prev_input)) + 1e-6)
-            mx.eval(l1_diff)
-            accumulated_l1 += l1_diff.item()
-
-            if accumulated_l1 < teacache_thresh and cached_residual is not None:
-                should_calc = False
-
-        if should_calc:
-            accumulated_l1 = 0.0
-
-            # --- Forward Pass Calls ---
-            # 1. Joint Subject + Text Pass
-            if ref_lat is not None:
-                v_cond = model(z, t_arr, ctx, ref_lat)
-            else:
-                v_cond = model(z, t_arr, ctx)
-            
-            # 2. Text-only Guidance Pass
-            if guide_img != 1.0 and ref_lat is not None:
-                v_text = model(z, t_arr, ctx)
-            else:
-                v_text = v_cond
-                
-            # 3. Unconditional Guidance Pass
-            if guide_text != 1.0:
-                v_uncond = model(z, t_arr, ctx_null)
-            else:
-                v_uncond = v_text
-
-            # Compute dual CFG guidance prediction
-            v_pred = v_uncond + guide_text * (v_text - v_uncond) + guide_img * (v_cond - v_text)
-            mx.eval(v_pred)
-
-            cached_residual = v_pred
-        else:
-            skipped_steps += 1
-            v_pred = cached_residual
-
-        prev_input = z
-
-        # Step update
-        z = z + v_pred * dt
-
-    if verbose and teacache_thresh > 0.0:
-        total_steps = len(shifted_timesteps) - 1
-        speedup = total_steps / max(1, total_steps - skipped_steps)
-        print(f"[TeaCache MLX] Skipped {skipped_steps}/{total_steps} steps (~{speedup:.2f}x speedup)")
-
-    # Ensure shape consistency for VAE decoding
-    if z.ndim == 5 and z.shape[0] == 1:
-        z = z[0]
-
-    return z
+    return latent[:, :-k]                                               # strip ref tail -> [16, F, h, w]
